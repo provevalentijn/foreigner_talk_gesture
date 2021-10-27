@@ -1,10 +1,5 @@
 ---
 title: "pd_kinematics"
-knit: (function(input_file, encoding) {
-  out_dir <- 'docs';
-  rmarkdown::render(input_file,
- encoding=encoding,
- output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
 author: "Valentijn Prové"
 date: "27-10-2021"
 output: html_document
@@ -107,8 +102,8 @@ kin.get <- function(MT)
 ```
 
 ```{r set directories, include=FALSE}
-datafolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/provevalentijn.github.io/data/") #set your working directory to the folder where you saved the datasets
-tsfolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/provevalentijn.github.io/data/ts/") #folder with the timeseries output from OpenPose
+datafolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/foreigner_talk_gesture/data/") #set your working directory to the folder where you saved the datasets
+tsfolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/foreigner_talk_gesture/data/ts/") #folder with the timeseries output from OpenPose
 ```
 
 ```{r import data, include=FALSE}
