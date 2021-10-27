@@ -1,0 +1,1172 @@
+---
+title: "pd_kinematics"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+author: "Valentijn Prové"
+date: "27-10-2021"
+output: html_document
+---
+
+```{r load packages, include=FALSE}
+library(rstudioapi)
+library(readbulk)
+library(signal) #for butterworth filter
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(pracma) #for peak finding
+library(kza) #for kz smoothing
+library(gganimate)
+library(gridExtra)
+library(ggpubr)
+
+#for statistics
+library(lme4)
+library(effects)
+library(rstatix)
+library(insight)
+library(lattice) 
+library(ggbeeswarm)
+library(MuMIn)
+```
+
+```{r define functions, include=FALSE}
+
+#append ELAN annotations to timeseries
+load.event <- function(time_ms_rec, g_d, column)
+{
+  output <- character(length = length(time_ms_rec))
+  output <- NA
+  for(i in g_d[,1])
+  {
+    #print(i)
+    output <- ifelse((time_ms_rec >= i & time_ms_rec <= g_d[,2][g_d[,1] == i]), as.character(g_d[,column][g_d[,1]==i]), output)
+  }
+  return(output) #provides a vector with the length of the time series with annotations
+}
+
+#compute speed
+speedXY.it <- function(x, y, time_millisecond)
+{
+  speed <- c(0, sqrt( rowSums( cbind(diff(x)^2, diff(y)^2)) ))
+  speed <<- speed/(c(0, diff(time_millisecond)/1000))
+}
+
+#apply butterworth filter for smoothing
+butter.it <- function(x)
+{bf <- butter(1, 1/33, type="low")
+x <- as.numeric(signal::filter(bf, x))}
+
+#apply butterworth filter with forward and reverse filtering
+butter.filtfilt <- function(x)
+{bf <- butter(1, 1/33, type="low")
+x <- as.numeric(signal::filtfilt(bf, x))}
+
+#kinematic feature extraction:
+kin.get <- function(MT)
+{
+  MT <- data.frame(MT)
+  #peaks are based on smoothed speed data
+  peaks    <- findpeaks(as.vector(scale(MT$xy_speed)), minpeakdistance = 8, minpeakheight = 0.5, threshold=0.5)
+  
+  #compute total submovements from all keypoints
+  submovements <- sum(c(nrow(peaks), na.rm=TRUE))
+
+  #compute average gesture space used by the gesture
+  range.x <- max(MT$x)-min(MT$x)
+  range.y <- max(MT$y)-min(MT$y)
+  gspace <- round(1000*(range.x*range.y), digits = 3)
+  gspace.log <- round(log(gspace+1), digits = 3) #log scale gspace because it explodes at high values
+  
+  #compute amplitudes (one-dimensional) 
+  ampl.y <- round(max(MT$y), digits =  3)
+  ampl.x <- round(max(MT$x), digits = 3)
+  
+  #compute triangular amplitude
+  ampl.tri <- round(max(MT$tri_peri), digits =  3)
+  
+  #compute trajectory length
+  trajectory <- round(sum(c(0, sqrt( rowSums( cbind(diff(MT$x)^2, diff(MT$y)^2)) ))), digits =  3)
+  
+  #compute peak velocity, based on smoothed speed data
+  peak.vel <- round(max(MT$xy_speed), digits =  3)
+  
+  #compute total duration
+  duration.ms <- max(MT$time_ms)-min(MT$time_ms)
+  
+  #bind everything into a single output object containing all the relevant kinematic features
+  features <- cbind(submovements,range.x, range.y,
+                    gspace, gspace.log, ampl.x, ampl.y, ampl.tri,
+                    trajectory, peak.vel, duration.ms)
+  return(features)
+}
+```
+
+```{r set directories, include=FALSE}
+datafolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/provevalentijn.github.io/data/") #set your working directory to the folder where you saved the datasets
+tsfolder <- paste0(dirname(dirname(rstudioapi::getSourceEditorContext()$path)), "/provevalentijn.github.io/data/ts/") #folder with the timeseries output from OpenPose
+```
+
+```{r import data, include=FALSE}
+ts <- read_bulk(tsfolder) # timeseries data
+
+#ELAN annotations
+annot.master <- read.csv(paste0(datafolder, "annot_master.csv")) # gesture units
+annot.rh <- read.csv(paste0(datafolder, "annot_rh.csv")) # right hand gesture phases
+annot.lh <- read.csv(paste0(datafolder, "annot_lh.csv")) #left hand gesture phases
+
+#make sure that the filenames are structured in the same way in all datasets
+ts$File <- gsub(".mp4_body25.csv", "\\1", ts$File)
+annot.master$File <- gsub("_segm.eaf", "\\1", annot.master$File)
+annot.rh$File <- gsub("_segm.eaf", "\\1", annot.rh$File)
+annot.lh$File <- gsub("_segm.eaf", "\\1", annot.lh$File)
+```
+
+Loop through the different video files to create a dataframe containing the gesture and phase rates and a dataframe with the preprocessed timeseries data
+```{r gesture rate and ts preprocess loop, include=FALSE}
+#create dataframes to store the output
+rates <- data.frame()
+ts.prepr <- data.frame()
+
+#loop through the files
+for (video in unique(ts$File)) {
+  print(video)
+  tssub <- subset(ts, File == video)
+  mastersub <- subset(annot.master, File == video)
+  rhsub <- subset(annot.rh, File == video)
+  lhsub <- subset(annot.lh, File == video)
+  
+  #add frame number
+  tssub$frame <- seq(nrow(tssub))
+  #add time in msec
+  tssub$time_ms <- round(seq(1000/(25), (nrow(tssub)*(1000/25)), by = 1000/25 ))
+  
+  #center wrists to Neck and scale to MidHip
+  #Neck becomes 0 and MidHip becomes 1
+  tssub$y7_bs <- -1*((tssub$y7-tssub$y1)/(tssub$y8-tssub$y1))
+  tssub$y4_bs <- -1*((tssub$y4-tssub$y1)/(tssub$y8-tssub$y1))
+  tssub$x7_bs <- (tssub$x7-tssub$x1)/(tssub$y8-tssub$y1)
+  tssub$x4_bs_rev <- -1*((tssub$x4-tssub$x1)/(tssub$y8-tssub$y1)) #reverse x-axis of right hand for amplitude interpretation
+  tssub$x4_bs <- (tssub$x4-tssub$x1)/(tssub$y8-tssub$y1)
+  
+  tssub$x1_bs <- (tssub$x1-tssub$x1)/(tssub$y8-tssub$y1)
+  tssub$y1_bs <- -1*(tssub$y1-tssub$y1)/(tssub$y8-tssub$y1)
+  tssub$x8_bs <- (tssub$x8-tssub$x1)/(tssub$y8-tssub$y1)
+  tssub$y8_bs <- -1*(tssub$y8-tssub$y1)/(tssub$y8-tssub$y1)
+  
+  #NOTE on scaling: for a perfect normalization, the angular velocity should be calculated for the elbow (triangle with shoulder and wrist),
+  #but we want absolute measures for gesture size
+  
+  #apply butterworth smoothing + forward and reverse filter
+  tssub$x4_bf <- butter.filtfilt(tssub$x4_bs)
+  tssub$y4_bf <- butter.filtfilt(tssub$y4_bs)
+  tssub$x7_bf <- butter.filtfilt(tssub$x7_bs)
+  tssub$y7_bf <- butter.filtfilt(tssub$y7_bs)
+  
+  #apply kz smoothing
+  tssub$x4_kz <- kz(tssub$x4_bs, m = 5, k = 3)
+  tssub$x4_kz_rev <- kz(tssub$x4_bs_rev, m = 5, k = 3)
+  tssub$y4_kz <- kz(tssub$y4_bs, m = 5, k = 3)
+  tssub$x7_kz <- kz(tssub$x7_bs, m = 5, k = 3)
+  tssub$y7_kz <- kz(tssub$y7_bs, m = 5, k = 3)
+  
+  #compute triangle perimeter (sum of euclidian lengths of traingle between neck, hip and wrist key points)
+  tssub$tri4_upper <- sqrt( rowSums( cbind((tssub$x4_kz)^2, (tssub$y4_kz)^2)) )#euclidian distance of upper side (neck to wrist)
+  tssub$tri4_lower <- sqrt( rowSums( cbind((tssub$x4_kz)^2, (tssub$y4_kz+1)^2)) )#euclidian distance of lower side (hip to wrist)
+  tssub$tri4_peri <- mapply(sum, 1, tssub$tri4_upper, tssub$tri4_lower, na.rm=TRUE) #distance between neck and hip is always 1 because of scaling procedure
+  
+  tssub$tri7_upper <- sqrt( rowSums( cbind((tssub$x7_kz)^2, (tssub$y7_kz)^2)) )#euclidian distance of upper side (neck to wrist)
+  tssub$tri7_lower <- sqrt( rowSums( cbind((tssub$x7_kz)^2, (tssub$y7_kz+1)^2)) )#euclidian distance of lower side (hip to wrist)
+  tssub$tri7_peri <- mapply(sum, 1, tssub$tri7_upper, tssub$tri7_lower, na.rm=TRUE) #distance between neck and hip is always 1 because of scaling procedure
+  
+  #compute velocity of left and right wrist (kz smooth)
+  tssub$xy4_speed <- speedXY.it(tssub$x4_kz, tssub$y4_kz, tssub$time_ms)
+  tssub$xy7_speed <- speedXY.it(tssub$x7_kz, tssub$y7_kz, tssub$time_ms)
+  #apply bf or kz smoothing
+  tssub$xy4_speed_bf <- c(0, butter.filtfilt(tssub$xy4_speed[is.finite(tssub$xy4_speed)]))
+  tssub$xy7_speed_bf <- c(0, butter.filtfilt(tssub$xy7_speed[is.finite(tssub$xy7_speed)]))
+  
+  tssub$xy4_speed_kz <- c(0, kz(tssub$xy4_speed[is.finite(tssub$xy4_speed)], m = 5, k = 3))
+  tssub$xy7_speed_kz <- c(0, kz(tssub$xy7_speed[is.finite(tssub$xy7_speed)], m = 5, k = 3))
+  
+  #load gesture annotations
+  tssub$g_unit <- load.event(tssub$time_ms, mastersub, 4)
+  tssub$phase_rh <- load.event(tssub$time_ms, rhsub, 4)
+  tssub$phase_lh <- load.event(tssub$time_ms, lhsub, 4)
+  
+  #bind iteration
+  ts.prepr <- rbind.data.frame(ts.prepr, tssub)
+  
+  #####
+  
+  #compute total description duration (=total file duration)
+  descr.dur.sec <- round(max(tssub$time_ms), digits = 2)/1000
+  descr.dur.ms <- round(max(tssub$time_ms), digits = 2)
+  
+  #remove non-gesture data
+  tssub <- subset(tssub, !is.na(tssub$g_unit))
+  
+  #count gesture segments in file
+  ges.freq <- length(unique(tssub$g_unit))
+  
+  #LOOP THROUGH ALL GESTURE SEGMENTS IN THIS FILE
+  #each time a new file enters the loop, create new placeholder for gesture segments
+  rates.ges <- data.frame()
+  temp.dur <- vector()
+  rates.phase <- data.frame()
+  for (s in unique(tssub$g_unit)) {
+    segmsub <- subset(tssub, g_unit == s) #subset of gesture unit
+    
+    ges.dur.ms <- max(segmsub$time_ms)-min(segmsub$time_ms) #compute duration of segment
+    
+    #MAKE NEW DATASET AND MERGE LEFT AND RIGHT WRISTS HORIZONTALLY FOR KINEMATIC FEATURES
+    
+    segmsub.4 <- subset(segmsub, !is.na(segmsub$g_unit), select = c(File, time_ms, g_unit, phase_rh)) #remove non-gesture data and create a dataset per hand
+
+    names(segmsub.4)[names(segmsub.4) == 'phase_rh'] <- 'phase'
+    if(nrow(segmsub.4) >= 1){
+      segmsub.4$hand <- "rh" 
+      }
+    
+    segmsub.4$phase <- gsub("RH", "\\1", segmsub.4$phase)
+    
+    segmsub.7 <- subset(segmsub, !is.na(segmsub$g_unit), select = c(File, time_ms, g_unit, phase_lh))           #remove non-gesture data and create a dataset per hand
+
+    names(segmsub.7)[names(segmsub.7) == 'phase_lh'] <- 'phase'
+    if(nrow(segmsub.7) >= 1){
+      segmsub.7$hand <- "lh" 
+      }
+    
+    segmsub.7$phase <- gsub("LH", "\\1", segmsub.7$phase)
+    
+    segmsub.4 <- subset(segmsub.4, phase != "rest")
+    segmsub.7 <- subset(segmsub.7, phase != "rest")
+    
+    segmsub.4$phase[segmsub.4$phase == "part_retr"] <- "retr"
+    segmsub.7$phase[segmsub.7$phase == "part_retr"] <- "retr"
+    
+    segmsub.4$g_unit.id <- paste0(segmsub.4$File, segmsub.4$g_unit, segmsub.4$hand)
+    segmsub.7$g_unit.id <- paste0(segmsub.7$File,  segmsub.7$g_unit, segmsub.7$hand)
+    
+    segmsub.4$phase.id <- paste0(segmsub.4$File, segmsub.4$g_unit, segmsub.4$hand, segmsub.4$phase)
+    segmsub.7$phase.id <- paste0(segmsub.7$File,  segmsub.7$g_unit, segmsub.7$hand, segmsub.7$phase)
+    
+    segmsub.bh <- rbind.data.frame(segmsub.4, segmsub.7)
+    
+    temp.hand <- data.frame()
+    for (h in unique(segmsub.bh$g_unit.id)) {
+      handsub <- subset(segmsub.bh, g_unit.id == h)
+      
+      #in this segment, assess for each phase whether it is present or not
+      hold <- ifelse(length(grep("hold", handsub$phase) >= 1), 1, 0)
+      stroke <- ifelse(length(grep("stroke", handsub$phase) >= 1), 1, 0)
+      prep <- ifelse(length(grep("prep", handsub$phase) >= 1), 1, 0)
+      retr <- ifelse(length(grep("retr", handsub$phase) >= 1), 1, 0)
+      
+      hand.feats <- cbind(stroke, hold, prep, retr, as.vector(handsub$g_unit.id[1]))
+      temp.hand <- rbind.data.frame(temp.hand, hand.feats)
+    }
+    
+    rates.ges <- rbind.data.frame(rates.ges, temp.hand)
+    
+    temp.dur <- c(temp.dur, ges.dur.ms)
+    
+  }
+  
+  #compute proportional gesture time
+  PoT <- sum(temp.dur)/descr.dur.ms
+  
+  stroke.freq <- sum(as.numeric(rates.ges$stroke))
+  hold.freq <- sum(as.numeric(rates.ges$hold))
+  prep.freq <- sum(as.numeric(rates.ges$prep))
+  retr.freq <- sum(as.numeric(rates.ges$retr))
+  
+  stroke.rate.min <- (stroke.freq/descr.dur.sec)*60
+  hold.rate.min <- (hold.freq/descr.dur.sec)*60
+  prep.rate.min <- (prep.freq/descr.dur.sec)*60
+  retr.rate.min <- (retr.freq/descr.dur.sec)*60
+  
+  ges.rate.min <- (ges.freq/descr.dur.sec)*60
+  
+  feats.file <- cbind(ges.freq, descr.dur.sec, ges.rate.min, PoT, stroke.freq, hold.freq, prep.freq, retr.freq,
+                      stroke.rate.min, hold.rate.min, prep.rate.min, retr.rate.min, as.vector(segmsub$File[1]))
+  
+  #accumulate computations per file
+  rates <- rbind.data.frame(rates, feats.file)
+
+  
+  #bind iteration
+  #ts.prepr <- rbind.data.frame(ts.prepr, tssub)
+}
+
+#add the column name for File
+colnames(rates) <- c(colnames(rates[1:12]), "File")
+
+#inspect the dataframes
+head(ts.prepr)
+head(rates)
+```
+
+We used two methods to check our preprocessing procedure. First, we created video plots that we synchronized with the original videos in ELAN. Second, we used graphs to tune our KZ filter (and reject the Butterworth filter).
+```{r make animated plots to check estimations in ELAN, eval=FALSE, include=FALSE}
+for (i in unique(ts.prepr$File)) {
+  fs <- subset(ts.prepr, File == i) 
+  fs.rh <- data.frame("time_ms" = fs$time_ms,
+                      "frame" = fs$frame,
+                            "x" = fs$x4_kz,
+                            "y" = fs$y4_kz)
+  
+  fs.rh$hand <- "rh"
+  
+  fs.lh <- data.frame("time_ms" = fs$time_ms,
+                      "frame" = fs$frame,
+                            "x" = fs$x7_kz,
+                            "y" = fs$y7_kz)
+  
+  fs.lh$hand <- "lh"
+  
+  fs.binder <- rbind(fs.rh, fs.lh)
+  
+  p <- ggplot(
+    fs.binder, 
+    aes(x = x, y=y, colour = hand)) +
+    geom_point(size = 0.5 )
+  
+  ggsave(p, file=paste0("plot_", i,".png"))
+  
+  p <- p + transition_time(time_ms) +
+    transition_states(time_ms, transition_length = 0,
+                      state_length = 1) +
+    shadow_mark(future = T, size = 0.5)
+  
+  a <- animate(p, nframes = max(fs$frame), fps = 25, renderer = av_renderer())
+  
+  anim_save(paste0(f, ".mp4"), a)
+  
+}
+```
+
+```{r check x- and y-coordinates and velocity for a random file, eval=FALSE, include=FALSE}
+sample <- subset(ts.prepr, File == "leuven5a_run1")
+
+y.plot <- ggplot(
+  sample, 
+  aes(x = time_ms)) +
+  geom_point(aes(y = y1, color="steelblue"), size = 0.5)+
+  geom_point(aes(y = y4, color="darkred"), size = 0.5) +
+  geom_point(aes(y = y7, color="orange"), size = 0.5) +
+  geom_point(aes(y = y8, color="black"), size = 0.5) +
+  ylab("y (pixels)") +
+  scale_y_reverse() +
+  ggtitle("y-positions of left and right wrist") +
+  scale_color_identity(name = "Body part",
+                       labels = c("hip", "right hand", "left hand", "neck"),
+                       guide = "legend")
+
+y.plot.bs <- ggplot(
+  sample, 
+  aes(x = time_ms)) +
+  geom_point(aes(y = y1_bs, color="steelblue"), size = 0.5)+
+  geom_point(aes(y = y4_bs, color="darkred"), size = 0.5) +
+  geom_point(aes(y = y7_bs, color="orange"), size = 0.5) +
+  geom_point(aes(y = y8_bs, color="black"), size = 0.5) +
+  ylab("y (scaling score)") +
+  theme(legend.position = "none") +
+  scale_color_identity(name = "Body part",
+                       labels = c("hip", "right hand", "left hand", "neck"),
+                       guide = "legend")
+
+y.plot.kz <- ggplot(
+  sample, 
+  aes(x = time_ms)) +
+  geom_point(aes(y = y1_bs, color="steelblue"), size = 0.5)+
+  geom_point(aes(y = y4_kz, color="darkred"), size = 0.5) +
+  geom_point(aes(y = y7_kz, color="orange"), size = 0.5) +
+  geom_point(aes(y = y8_bs, color="black"), size = 0.5) +
+  ylab("y (KZ filter)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text=element_text(size=16)) +
+  scale_color_identity(name = "Body part",
+                       labels = c("hip", "right hand", "left hand", "neck"),
+                       guide = "legend")
+
+x.plot.kz <- ggplot(
+  sample, 
+  aes(x = time_ms)) +
+  geom_point(aes(y = y1_bs, color="steelblue"), size = 0.5)+
+  geom_point(aes(y = -1*(x4_kz), color="darkred"), size = 0.5) +
+  geom_point(aes(y = x7_kz, color="orange"), size = 0.5) +
+  ylab("y (KZ filter)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text=element_text(size=16)) +
+  scale_color_identity(name = "Body part",
+                       labels = c("hip", "right hand", "left hand", "neck"),
+                       guide = "legend")
+
+subplot(ggplotly(y.plot.kz, dynamicTicks = TRUE), ggplotly(x.plot.kz, dynamicTicks = TRUE), nrows = 2, heights = c(0.3,0.3), shareX = T)
+
+#ggarrange(y.plot, y.plot.bs, y.plot.kz, common.legend = T, legend = "bottom", nrow = 3)
+#subplot(plotly(y.plot), plotly(y.plot.bs), plotly(y.plot.kz), common.legend = T, legend = "bottom", nrow=3)
+```
+
+```{r delete ts data that is not correct, include=FALSE}
+ts.prepr <- subset(ts.prepr, File != "antwerp2a_run1")
+ts.prepr <- subset(ts.prepr, File != "antwerp2a_run2")
+ts.prepr <- subset(ts.prepr, File != "leuven11a_run1")
+ts.prepr <- subset(ts.prepr, File != "leuven11a_run2")
+ts.prepr <- subset(ts.prepr, File != "luik5a_run1")
+ts.prepr <- subset(ts.prepr, File != "luik5a_run2")
+
+ts.prepr <- subset(ts.prepr, File != "luik1a_run1")
+ts.prepr <- subset(ts.prepr, File != "luik2b_run2")
+ts.prepr <- subset(ts.prepr, File != "antwerp1a_run1")
+
+rates <- subset(rates, File != "luik5a_run1")
+```
+
+```{r get kinematic measures, include=FALSE}
+#make separate datasets for right and left hand
+
+g.rh <- data.frame("time_ms" = ts.prepr$time_ms,
+                       "x" = ts.prepr$x4_kz_rev,
+                       "y" = ts.prepr$y4_kz,
+                       "xy_speed" = ts.prepr$xy4_speed_kz,
+                       "tri_peri" = ts.prepr$tri4_peri,
+                       "File" = ts.prepr$File,
+                       "g_unit" = ts.prepr$g_unit,
+                       "phase" = ts.prepr$phase_rh, "hand" = "rh")
+
+g.rh <- subset(g.rh, !is.na(phase)) #delete ts data where phase is NA (no gesture)
+g.rh <- subset(g.rh, phase != "rest") #delete ts data where phase is rest
+
+g.lh <- data.frame("time_ms" = ts.prepr$time_ms,
+                   "x" = ts.prepr$x7_kz,
+                   "y" = ts.prepr$y7_kz,
+                   "xy_speed" = ts.prepr$xy7_speed_kz,
+                   "tri_peri" = ts.prepr$tri7_peri,
+                   "File" = ts.prepr$File,
+                   "g_unit" = ts.prepr$g_unit,
+                   "phase" = ts.prepr$phase_lh, "hand" = "lh")
+
+g.lh <- subset(g.lh, !is.na(phase)) #delete ts data where phase is NA (no gesture)
+g.lh <- subset(g.lh, phase != "rest") #delete ts data where phase is rest
+
+g.rh$feats_id <- paste0(g.rh$File, g.rh$g_unit)
+g.lh$feats_id <- paste0(g.lh$File, g.lh$g_unit)
+
+#compute kinematic features for each hand
+
+f.rh <- data.frame() #make dataframe for right hand
+for (i in unique(g.rh$feats_id)) {
+  id <- subset(g.rh, feats_id == i)
+  cc <- cbind(kin.get(id),as.vector(id$feats_id[1]), as.vector(id$hand[1]))
+  f.rh <- rbind.data.frame(f.rh, cc)
+}
+
+colnames(f.rh) <- c(colnames(f.rh[1:11]), "feats_id", "hand")
+
+f.lh <- data.frame() #make dataframe for left hand
+for (i in unique(g.lh$feats_id)) {
+  id <- subset(g.lh, feats_id == i)
+  cc <- cbind(kin.get(id),as.vector(id$feats_id[1]), as.vector(id$hand[1]))
+  f.lh <- rbind.data.frame(f.lh, cc)
+}
+
+colnames(f.lh) <- c(colnames(f.lh[1:11]), "feats_id", "hand")
+
+#merge left and right hand dataframes
+
+f <- merge(f.rh, f.lh, by = "feats_id", all = T, suffixes = c(".rh",".lh"))
+
+write.csv(f, paste0(datafolder, "f.csv"))
+f <- read.csv(paste0(datafolder, "f.csv"))
+
+#create one measure for both hands:
+  #determine wether a gesture is one-handed (rh, lh) or two-handed (rhlh)
+f$hand.rh[is.na(f$hand.rh)] <- ""
+f$hand.lh[is.na(f$hand.lh)] <- ""
+f$hand <- paste0(f$hand.rh, f$hand.lh)
+  #calculate pairwise maximum so as to obtain a global measure for one gesture unit
+f$gspace.log <- pmax(f$gspace.log.rh, f$gspace.log.lh, na.rm=TRUE)
+f$ampl.x <- pmax(f$ampl.x.rh, f$ampl.x.lh, na.rm=TRUE)
+f$ampl.y <- pmax(f$ampl.y.rh, f$ampl.y.lh, na.rm=TRUE)
+f$ampl.tri <- pmax(f$ampl.tri.rh, f$ampl.tri.lh, na.rm=TRUE)
+f$trajectory <- pmax(f$trajectory.rh, f$trajectory.lh, na.rm=TRUE)
+f$peak.vel <- pmax(f$peak.vel.rh, f$peak.vel.lh, na.rm=TRUE)
+f$duration.ms <- pmax(f$duration.ms.rh, f$duration.ms.lh, na.rm=TRUE)
+
+head(f)
+```
+
+```{r append file information, include=FALSE}
+info <- read.csv(paste0(datafolder, "lal_info.csv"), sep = ";", header = T) #import data
+
+f$File <- gsub("segm_[0-9]*", "\\1", f$feats_id)
+ts.prepr <- merge(ts.prepr, info, by = "File", all.y = F)
+f <- merge(f, info, by = "File", all.y = F)
+rates <- merge(rates, info, by = "File", all.y = F)
+
+f$run <- gsub("[a-z]*[0-9]*[a-b]_", "\\1", f$File)
+rates$run <- gsub("[a-z]*[0-9]*[a-b]_", "\\1", rates$File)
+f$run_first <- "no"
+f$run_first[grep("a_run1", f$File)] <- "yes"
+
+f$subject <- gsub("_run[1-2]", "\\1", f$File)
+f$subject <- gsub("antwerp", "AN", f$subject)
+f$subject <- gsub("leuven", "LE", f$subject)
+f$subject <- gsub("luik", "LU", f$subject)
+
+rates$subject <- gsub("_run[1-2]", "\\1", rates$File)
+rates$subject <- gsub("antwerp", "AN", rates$subject)
+rates$subject <- gsub("leuven", "LE", rates$subject)
+rates$subject <- gsub("luik", "LU", rates$subject)
+
+rates <- subset(rates, subject != "AN2a")
+rates <- rates[-5, ]
+```
+
+Untill here, we need to run every chunk to be able to work with the data
+```{r write dataframes and load them again to obtain numerical variables, include=FALSE}
+write.csv(rates, "rates.csv")
+write.csv(f, "f.csv")
+
+rates <- read.csv("rates.csv")
+f <- read.csv("f.csv")
+```
+
+```{r plot gesture trajectories and amplitudes, eval=FALSE, include=FALSE}
+#sample <- subset(ts.prepr, File == "leuven5a_run1")
+sample <- ts.prepr
+
+ts.rh <- data.frame("x" = sample$x4_kz,
+                    "y" = sample$y4_kz,
+                    "condition" = sample$condition,
+                    "phase" = sample$phase_rh)
+
+ts.rh$hand <- "rh"
+
+ts.lh <- data.frame("x" = sample$x7_kz,
+                    "y" = sample$y7_kz,
+                    "condition" = sample$condition,
+                    "phase" = sample$phase_rh)
+
+ts.lh$hand <- "lh"
+
+ts.binder <- rbind(ts.rh, ts.lh)
+
+f$p1.condition.num.x <- f$condition
+f$p1.condition.num.x[grep("nns", f$p1.condition.num.x)] <- -0.4
+f$p1.condition.num.x[grep("ns", f$p1.condition.num.x)] <- -0.6
+f$p1.condition.num.x <- as.numeric(f$p1.condition.num.x)
+
+f$p1.condition.num.y <- f$condition
+f$p1.condition.num.y[grep("nns", f$p1.condition.num.y)] <- -0.9
+f$p1.condition.num.y[grep("ns", f$p1.condition.num.y)] <- -1.0
+f$p1.condition.num.y <- as.numeric(f$p1.condition.num.y)
+
+f$p2.condition.num.x <- f$condition
+f$p2.condition.num.x[grep("nns", f$p2.condition.num.x)] <- 0.4
+f$p2.condition.num.x[grep("ns", f$p2.condition.num.x)] <- 0.6
+f$p2.condition.num.x <- as.numeric(f$p2.condition.num.x)
+
+f$p2.condition.num.y <- f$condition
+f$p2.condition.num.y[grep("nns", f$p2.condition.num.y)] <- -0.9
+f$p2.condition.num.y[grep("ns", f$p2.condition.num.y)] <- -1.0
+f$p2.condition.num.y <- as.numeric(f$p2.condition.num.y)
+
+p1 <- ggplot() +
+  geom_point(data = ts.rh, aes(x = x, y = y), color = "grey", size = 0.5, alpha = 0.2) +
+  geom_point(data = ts.lh, aes(x = x, y = y, color = condition), size = 0.7, alpha = 0.2) +
+  geom_boxplot(data = f, aes(x = p1.condition.num.x, y = ampl.y.lh, fill=condition), width = 0.6) +
+  geom_boxplot(data = f, aes(x = ampl.x.lh, y = p1.condition.num.y, fill=condition), width = 0.6) +
+  ggtitle("Left hands") +
+  ylab("y-position") +
+  xlab("x-position") +
+  theme_bw()+
+  coord_fixed(ratio = 1);p1
+
+p2 <- ggplot() +
+  geom_point(data = ts.lh, aes(x = x, y = y), color = "grey", size = 0.5, alpha = 0.2) +
+  geom_point(data = ts.rh, aes(x = x, y = y, color = condition), size = 0.7, alpha = 0.2) + # must include argument label "data"
+  geom_boxplot(data = f, aes(x = p2.condition.num.x, y = ampl.y.rh, fill=condition), width = 0.6) +
+  geom_boxplot(data = f, aes(x = -1*(ampl.x.rh), y = p2.condition.num.y, fill=condition), width = 0.6) +
+  ggtitle("Right hands") +
+  ylab("y-position") +
+  xlab("x-position") +
+  theme_bw()+
+  coord_fixed(ratio = 1);p2
+
+ggarrange(p2, p1, common.legend = T, legend = "right", nrow = 1)
+```
+
+```{r illustrate, eval=FALSE, include=FALSE}
+library(png)
+im <- readPNG("leuven5a_run1_65591.png")
+
+
+fs <- subset(ts.prepr, File == "leuven5a_run1")
+fsg <- subset(fs, g_unit == "segm_9")
+
+fs.rh <- data.frame("time_ms" = fs$time_ms,
+                    "x" = fs$x4_kz,
+                    "y" = fs$y4_kz)
+
+fs.rh$hand <- "right"
+
+fs.lh <- data.frame("time_ms" = fs$time_ms,
+                    "x" = fs$x7_kz,
+                    "y" = fs$y7_kz)
+
+fs.lh$hand <- "left"
+
+fs.binder <- rbind(fs.rh, fs.lh)
+
+p <- ggplot(
+  fs.binder, 
+  aes(x = x, y= y, colour = hand)) +
+  geom_point(size = 0.5 )+ 
+  coord_fixed(ratio =1) +
+  ylab("y-position")+
+  xlab("x-position")+
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 3))); p
+
+p2 <- p + geom_point(data = fsg, aes(x = x4_kz, y=y4_kz), color = "black") + geom_point(data = fsg, aes(x = x7_kz, y=y7_kz), color = "black"); p2
+
+ggplot(data = fsg, aes(x = x4_kz, y=y4_kz)) +
+  geom_point(color = "black") +
+  geom_point(data = fsg, aes(x = x7_kz, y=y7_kz), color = "black") +
+  geom_point(size = 0.5 )+ 
+  coord_fixed(ratio =1) +
+  ylab("Y-position")+
+  xlab("X-position")+
+  theme_bw()
+
+ggsave("fig_measures_dpi600.png", units="in", width=4, height=6, dpi=600)
+
+```
+
+```{r define maximally distinct colors for subjects}
+cols <- c("#f4aba0",
+"#0257d8",
+"#199e13",
+"#9b30b7",
+"#4b9500",
+"#654fd6",
+"#edc139",
+"#ba82ff",
+"#a89c00",
+"#ef54d1",
+"#00d28f",
+"#a20090",
+"#83d98a",
+"#ff468e",
+"#00c6ba",
+"#bd001a",
+"#0086ec",
+"#eb9b00",
+"#8991ff",
+"#818d00",
+"#ff8fec",
+"#4d6000",
+"#cfb1ff",
+"#d47500",
+"#007ac8",
+"#ff7826",
+"#008cb9",
+"#ff9831",
+"#514a8c",
+"#776900",
+"#3d5787",
+"#ff8f63",
+"#009771",
+"#b1004f",
+"#9ad3a7",
+"#8f3900",
+"#00684a",
+"#ffadbf",
+"#826237",
+"#793e6a",
+"#ffa781")
+```
+
+```{r gesture rate}
+
+rates <- subset(rates, File != "antwerp2a_run2")
+rates <- subset(rates, File != "antwerp1b_run1")
+rates <- subset(rates, File != "antwerp1b_run2")
+rates <- subset(rates, File != "luik3a_run1")
+
+mean(rates$ges.freq)
+sd(rates$ges.freq)
+mean(rates$descr.dur.sec)
+
+rates %>%
+  group_by(language) %>%
+  get_summary_stats(hold.rate.min, type = "mean_sd")
+
+rates$PoT <- as.numeric(rates$PoT)
+
+rates %>%
+  group_by(condition) %>%
+  get_summary_stats(PoT, type = "mean_sd")
+
+summary(a <- aov(ges.rate.min ~ condition + gender + language, data = rates))
+
+summary(a <- aov(hold.rate.min ~ condition + gender + language, data = rates))
+
+summary(a <- aov(PoT ~ condition + gender + language, data = rates))
+
+res.aov <- anova_test(
+  data = rates, dv = PoT, wid =subject
+  ,within = run
+  ,between = c(condition, gender)
+)
+get_anova_table(res.aov)
+
+res.aov <- anova_test(
+  data = rates, dv = ges.rate.min, wid =subject
+  ,within = run
+  ,between = c(condition, gender)
+)
+get_anova_table(res.aov)
+
+res.aov <- anova_test(
+  data = rates, dv = hold.rate.min, wid =subject
+  ,within = run
+  ,between = c(condition, gender)
+)
+get_anova_table(res.aov)
+
+ggplot(rates, aes(x=run, y=PoT, fill=language)) + 
+  geom_boxplot()
+```
+
+```{r PoT (proportion of gesture time)}
+mean(rates$PoT)
+sd(rates$PoT)
+
+rates %>%
+  group_by(condition) %>%
+  get_summary_stats(PoT, type = "mean_sd")
+
+summary(a <- aov(PoT ~ condition, data = rates))
+
+ggplot(rates, aes(x=condition, y=PoT, fill=item)) + 
+  geom_boxplot()
+
+ggplot(rates, aes(run, PoT, shape=item)) +
+  geom_point(aes(color=item)) +
+  geom_line(aes(group = subject)) +
+  facet_grid(.~condition) +
+  theme_bw()
+
+ggplot(rates, aes(language, ges.rate.min)) +
+  geom_boxplot() +
+  #geom_point()
+  geom_beeswarm(data = rates, aes(language, ges.rate.min, color=subject),
+                dodge.width = 0.9, alpha = 0.8) +
+  scale_color_manual(values = cols) +
+  facet_grid(.~condition) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  stat_summary(fun.y = mean, color = "red", geom = "line", aes(group = 1)) + 
+  stat_summary(fun.y=mean, geom="point", shape = 1, color="red", size = 4)
+
+```
+
+```{r gesture size, eval=FALSE, include=FALSE}
+f <- read.csv("f.csv")
+#make a boxplot with gesture space values per subject
+ggplot(f, aes(x=gspace.log, y=subject, fill=condition)) + 
+  geom_boxplot()
+
+#reorder some factor levels for intuitive interpretation
+f$condition <- as.factor(f$condition)
+levels(f$condition)
+f$condition <- factor(f$condition,levels(f$condition)[c(2,1)])
+
+#linear mixed effects model
+  #gesture space
+m0 = lmer(gspace.log ~ (1|subject) + (1|item), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + gender)
+m3 = update(m2,.~. + language)
+
+r.squaredGLMM(m1)
+
+summary(m1)
+
+fixed <- do.call(rbind.data.frame, as.data.frame(allEffects(m1)))
+
+fixed$gspace.log <- fixed$fit
+
+#FIGURE 5
+ggplot(data = fixed, aes(x = condition, y = gspace.log)) +
+  geom_beeswarm(data = f, aes(condition, gspace.log, color=subject), dodge.width = 0.9, alpha = 0.8) +
+  #scale_color_manual(values=cols) +
+  scale_color_manual(values = sample(gray.colors(41))) +
+  geom_point(aes(group = 1), size = 3) +
+  geom_line(aes(group = 1), color="black",size=1) + 
+  geom_errorbar(aes(x = condition, ymin = lower, ymax = upper),
+                color="red",width=0.1,size=1) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size=14),
+        axis.text = element_text(size=12)) +
+  ylab("Gesture space") +
+  xlab("Condition") +
+  geom_hline(yintercept = 4.335, linetype = "dashed", size = 1)+
+  scale_x_discrete(labels=c("ns" = "NS", "nns" = "NNS"))
+
+ggsave("fig_lmer_gspace_1200dpi.png", units="in", width=5, height=4, dpi=1200)
+
+```
+
+```{r brol?, eval=FALSE, include=FALSE}
+#linear mixed effects model
+  #horizontal amplitude
+
+f$condition <- as.factor(f$condition)
+levels(f$condition)
+f$condition <- factor(f$condition,levels(f$condition)[c(2,1)])
+
+m0 = lmer(ampl.y ~ (1|subject) + (1|item), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + gender)
+m3 = update(m2,.~. + language)
+
+summary(m1)
+anova(m0, m1)
+
+randoms <- ranef(m1, condVar=TRUE)
+dotplot(randoms)
+
+str(dd <- as.data.frame(randoms))
+dd$condition <- "NS"
+dd$condition[grep("LE", dd$grp)] <- "NNS"
+dd <- subset(dd, grpvar != "item")
+
+dd %>%
+  arrange(condsd) %>%
+  mutate(grp=factor(grp, levels=grp)) %>%
+  ggplot(aes(y=grp,x= condval, color = condition)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin=condval -2*condsd, xmax=condval +2*condsd), height=0) +
+  theme_bw() +
+  scale_x_continuous(n.breaks = 10)
+
+test %>%
+  arrange(range.y) %>%
+  mutate(subject=factor(subject, levels=subject)) %>%
+  ggplot(aes(y=subject,x= range.y, color = condition)) +
+  geom_point() +
+  #geom_errorbarh(aes(xmin=condval -2*condsd, xmax=condval +2*condsd), height=0) +
+  theme_bw() +
+  scale_x_continuous(n.breaks = 10)
+
+r.squaredGLMM(m1)
+
+fixed <- do.call(rbind.data.frame, as.data.frame(allEffects(m1)))
+
+fixed$ampl.y <- fixed$fit
+
+test <- data.frame()
+for (i in unique(f$subject)) {
+  subj <- subset(f, subject == i)
+  subj$range.y <- max(subj$ampl.y) - min(subj$ampl.y)
+  subj$range.x <- max(subj$ampl.x) - min(subj$ampl.x)
+  subj$max.y <- max(subj$ampl.y)
+  subj$max.x <- max(subj$ampl.x)
+  subj$sd.y <- sd(subj$ampl.y)
+  subj$sd.x <- sd(subj$ampl.x)
+  test <- rbind.data.frame(test, subj)
+}
+
+test$neck <- "above"
+test$neck[test$max.y < 0.05] <- "under"
+
+t <- table(test$neck, test$condition)
+chisq <- chisq.test(t)
+chisq$residuals
+
+test <- distinct(test, subject, .keep_all = T)
+
+test %>%
+  group_by(condition) %>%
+  get_summary_stats(range.y, type = "mean_sd")
+
+test$condition <- as.factor(test$condition)
+levels(test$condition)
+t.test(test$range.y ~ test$condition, var.equal = T)
+boxplot(test$range.y ~ test$condition)
+
+#test$subject <- as.factor(test$subject)
+
+test %>%
+  ggplot(aes(x = reorder(subject, range.y), y = ampl.y, shape = neck,
+             color = condition)) +
+  geom_point() +
+  scale_color_manual(values=c("black","grey"),
+                     name = "Condition", labels = c("NNS", "NS")) +
+  scale_shape_manual(values=c(15,1),
+                     name = "Highest amplitude", labels = c("Above neck", "Under neck")) +
+  geom_hline(yintercept = 0.05, linetype = "solid", size = 1, color = "red")+
+  annotate("text", x = 3, y = 0.1, label = "Neck", color = "red") +
+  ylab("Vertical amplitude") +
+  xlab("Gestures per subject") +
+  theme_bw() +
+  theme(axis.text.x=element_blank(),
+        text = element_text(size=14),
+        axis.text = element_text(size=12))
+
+ggsave("fig_viz_amply_1200dpi.png", units="in", width=6, height=4, dpi=1200)
+```
+
+```{r brol2?, eval=FALSE, include=FALSE}
+
+x0 = lmer(ampl.x ~ (1|subject) + (1|item), data=f, REML = F)
+x1 = update(x0,.~. + condition)
+
+y0 = lmer(ampl.y ~ (1|subject) + (1|item), data=f, REML = F)
+y1 = update(y0,.~. + condition)
+
+fixedx <- do.call(rbind.data.frame, as.data.frame(allEffects(x1)))
+fixedy <- do.call(rbind.data.frame, as.data.frame(allEffects(y1)))
+
+fixedx$ampl.x <- fixedx$fit
+fixedy$ampl.y <- fixedy$fit
+
+fpx <- ggplot(data = fixedx, aes(x = condition, y = ampl.x)) +
+  geom_beeswarm(data = f, aes(condition, ampl.x, color=subject), dodge.width = 0.9, alpha = 0.8) +
+  scale_color_manual(values=cols) +
+  geom_point(aes(group = 1), size = 3) +
+  geom_line(aes(group = 1), color="black",size=1) + 
+  geom_errorbar(aes(x = condition, ymin = lower, ymax = upper),
+                color="red",width=0.1,size=1) +
+  theme_bw() +
+  theme(legend.position = "none"); fpx
+
+fpy <- ggplot(data = fixedy, aes(x = condition, y = ampl.y)) +
+  geom_beeswarm(data = f, aes(condition, ampl.y, color=subject), dodge.width = 0.9, alpha = 0.8) +
+  scale_color_manual(values=cols) +
+  geom_point(aes(group = 1), size = 3) +
+  geom_line(aes(group = 1), color="black",size=1) + 
+  geom_errorbar(aes(x = condition, ymin = lower, ymax = upper),
+                color="red",width=0.1,size=1) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_y_continuous(n.breaks = 16)
+
+ggarrange(fpx, fpy, nrow = 1)
+
+px <- test %>%
+  #arrange(range.y) %>%
+  #mutate(subject=factor(unique(subject), levels=subject)) %>%
+  ggplot(aes(x = reorder(subject, -range.x), y = ampl.x, color = condition)) +
+  geom_point() +
+  scale_shape_manual(values=c(17,6)) +
+  scale_size_manual(values=c(2,4)) +
+  theme_bw() +
+  theme(axis.text.x=element_blank()) +
+  labs(x = "subject (ordered by vertical range)",
+       y = "horizontal amplitude") +
+  scale_y_continuous(n.breaks = 10)
+```
+
+```{r rest, eval=FALSE, include=FALSE}
+
+
+cols <- c("#f4aba0",
+"#0257d8",
+"#199e13",
+"#9b30b7",
+"#4b9500",
+"#654fd6",
+"#edc139",
+"#ba82ff",
+"#a89c00",
+"#ef54d1",
+"#00d28f",
+"#a20090",
+"#83d98a",
+"#ff468e",
+"#00c6ba",
+"#bd001a",
+"#0086ec",
+"#eb9b00",
+"#8991ff",
+"#818d00",
+"#ff8fec",
+"#4d6000",
+"#cfb1ff",
+"#d47500",
+"#007ac8",
+"#ff7826",
+"#008cb9",
+"#ff9831",
+"#514a8c",
+"#776900",
+"#3d5787",
+"#ff8f63",
+"#009771",
+"#b1004f",
+"#9ad3a7",
+"#8f3900",
+"#00684a",
+"#ffadbf",
+"#826237",
+"#793e6a",
+"#ffa781")
+
+library(ggbeeswarm)
++
+  geom_beeswarm(data = f, aes(condition, gspace.log, color=subject, dodge.width = 1, alpha = 1)) +
+  facet_grid(.~item)
+
+ggplot(data = f, aes(run, gspace.log, color=item)) +
+  geom_boxplot(aes(group=run), width = 0.5) +
+  geom_beeswarm(dodge.width = 0.5, alpha = 1) +
+  #scale_color_manual(values=cols) +
+  facet_grid(.~condition) +
+  theme_bw() +
+  geom_errorbar(data = fixed, aes(x = condition, ymin = lower, ymax = upper),
+                color="purple",width=0.1,size=1)
+
+anova(m3, m2)
+summary(m1)
+plot(allEffects(m1))
+
+str(allEffects(m1))
+
+  #x-amplitude
+m0 = lmer(ampl.x ~ (1|subject), data=f, REML = F)
+m1 = update(m0,.~. + hand)
+m2 = update(m1,.~. + condition)
+m3 = update(m2,.~. + run)
+m4 = lmer(ampl.x ~  hand + condition *run + (1|subject), data=f, REML = F)
+
+anova(m1, m2)
+summary(m3)
+plot(allEffects(m3))
+
+  #y-amplitude
+m0 = lmer(ampl.y ~ (1|subject), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + run)
+m3 = update(m2,.~. + language)
+
+anova(m2, m1)
+summary(m2)
+plot(allEffects(m2))
+```
+
+```{r randoms, eval=FALSE, include=FALSE}
+coef(m1)
+summary(m1)
+
+randoms <- ranef(m1, condVar=TRUE)
+dotplot(randoms)
+
+str(dd <- as.data.frame(randoms))
+dd$condition <- "NS"
+dd$condition[grep("LE", dd$grp)] <- "NNS"
+dd$condition[grep("item", dd$grpvar)] <- "item"
+
+#FIGURE 4
+
+ggplot(dd, aes(y=grp,x=condval)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin=condval -2*condsd, xmax=condval +2*condsd), height=0) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text=element_text(size=10),
+        axis.title=element_text(size=14),
+        axis.text.y = element_blank(),
+        strip.text = element_text(size = 14)) +
+  facet_grid(rows = vars(grpvar), scales = "free_y") +
+  labs(y="Grouping variable", x = "Conditional mean") +
+  facet_grid(rows = vars(grpvar), scales = "free_y")
+
+ggsave("fig_ranef_gspace_1200dpi.png", units="in", width=5, height=4, dpi=1200)
+
+
+ggplot(dd, aes(y=grp,x=condval)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin=condval -2*condsd, xmax=condval +2*condsd), height=0) +
+  theme_bw() +
+  facet_grid(rows = vars(grpvar), scales = "free_y") +
+  scale_x_continuous(n.breaks = 10)
+```
+
+```{r peak velocity, eval=FALSE, include=FALSE}
+
+f$mean.vel <- f$trajectory/f$duration.ms
+
+m0 = lmer(peak.vel ~ (1|subject) + (1|item), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + gender)
+
+anova(m0, m1)
+summary(m1)
+plot(allEffects(m1))
+
+m0 = lmer(trajectory ~ (1|subject), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + language)
+
+anova(m2, m1)
+summary(m1)
+plot(allEffects(m1))
+
+fixedtraj <- do.call(rbind.data.frame, as.data.frame(allEffects(m1)))
+
+m0 = lmer(duration.ms ~ (1|subject) + (1|item), data=f, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + gender)
+
+anova(m0, m1)
+summary(m1)
+plot(allEffects(m1))
+
+fixeddur<- do.call(rbind.data.frame, as.data.frame(allEffects(m1)))
+
+f %>%
+  group_by(condition) %>%
+  get_summary_stats(c(trajectory, duration.ms, peak.vel), type = "mean_sd")
+```
+
+```{r hold duration, eval=FALSE, include=FALSE}
+annot.rh$hand <- "rh"
+annot.lh$hand <- "lh"
+names(annot.rh)[names(annot.rh) == 'RH_phase'] <- 'phase'
+names(annot.lh)[names(annot.lh) == 'LH_phase'] <- 'phase'
+holds <- subset((rbind(annot.rh, annot.lh)), phase == "stroke")
+holds$File <- gsub("_segm.eaf", "\\1", holds$File)
+
+holds <- merge(holds, info, by = "File", all.y = F)
+
+holds$run <- gsub("[a-z]*[0-9]*[a-b]_", "\\1", holds$File)
+
+holds$subject <- gsub("_run[1-2]", "\\1", holds$File)
+holds$subject <- gsub("antwerp", "AN", holds$subject)
+holds$subject <- gsub("leuven", "LE", holds$subject)
+holds$subject <- gsub("luik", "LU", holds$subject)
+
+m0 = lmer(Duration...msec ~ (1|subject) + (1|item), data=holds, REML = F)
+m1 = update(m0,.~. + condition)
+m2 = update(m1,.~. + gender)
+m3 = update(m2,.~. + language)
+
+anova(m2, m3)
+summary(m3)
+plot(allEffects(m3))
+```
+
+
