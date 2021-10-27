@@ -1,0 +1,13 @@
+name: "Strategies and effects of Foreigner Talk"
+output_dir: "docs"
+navbar:
+  title: "Strategies and effects of Foreigner Talk"
+  left:
+  - text: "Home"
+   href: index.html
+  - text: "Gesture kinematics in picture descriptions"
+   href: pd_kinematics.html
+output:
+  html_document:
+ theme: cosmo
+
