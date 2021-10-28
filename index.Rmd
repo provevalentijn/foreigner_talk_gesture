@@ -1,32 +1,14 @@
 ---
-title: "index"
+title: "About this website"
 author: "Valentijn Prové"
 date: "28-10-2021"
 output: html_document
 ---
 
-This is my homepage.
+The purpose of this website is currently to provide a way to easily access the supplementary material to the working paper "Foreigner Directed Gesture: larger, faster, longer" (Valentijn Prové, Bert Oben and Julien Perrez). The manuscript is accessible through [Leuven Working Papers in Linguistics](https://www.arts.kuleuven.be/ling/workingpapers), LWPL39.
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
+Go to the "script" page to see a version of the full code and an output preview.
 
-## R Markdown
+The full material is made available through GitHub and Zenodo, with the following identifier: 
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
-```
-
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+[![DOI](https://zenodo.org/badge/421998192.svg)](https://zenodo.org/badge/latestdoi/421998192)
